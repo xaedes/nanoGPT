@@ -10,6 +10,7 @@ from model import GPTConfig, GPT
 
 # -----------------------------------------------------------------------------
 out_dir = 'out'
+ckpt_fn = 'ckpt.pt'
 start = "\n" # or "<|endoftext|>" or whatever you like
 num_samples = 10 # number of samples to draw
 max_new_tokens = 500 # number of tokens generated in each sample
@@ -31,7 +32,7 @@ ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16, 'float16': torc
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
 # model
-ckpt_path = os.path.join(out_dir, 'ckpt.pt')
+ckpt_path = os.path.join(out_dir, ckpt_fn)
 checkpoint = torch.load(ckpt_path, map_location=device)
 gptconf = GPTConfig(**checkpoint['model_args'])
 model = GPT(gptconf)

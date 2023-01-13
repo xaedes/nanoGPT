@@ -25,6 +25,7 @@ from model import GPTConfig, GPT
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
+ckpt_fn = 'ckpt.pt'
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
@@ -228,7 +229,7 @@ while True:
                     'config': config,
                 }
                 print(f"saving checkpoint to {out_dir}")
-                torch.save(checkpoint, os.path.join(out_dir, 'ckpt.pt'))
+                torch.save(checkpoint, os.path.join(out_dir, ckpt_fn))
     if iter_num == 0 and eval_only:
         break
 
