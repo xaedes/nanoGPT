@@ -19,13 +19,18 @@ import torch
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed import init_process_group, destroy_process_group
 
-from model import GPTConfig, GPT
+import pickle
+import tiktoken
+
+from model import GPTConfig, GPT, ContextGPT
 
 # -----------------------------------------------------------------------------
 # default config values designed to train a gpt2 (124M) on OpenWebText
 # I/O
 out_dir = 'out'
 ckpt_fn = 'ckpt.pt'
+context = ''
+enable_context = True
 eval_interval = 2000
 log_interval = 1
 eval_iters = 200
@@ -87,29 +92,62 @@ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.aut
 ptdtype = {'float32': torch.float32, 'bfloat16': torch.bfloat16}[dtype]
 ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=device_type, dtype=ptdtype)
 
+# look for the meta pickle in case it is available in the dataset folder
+load_meta = False
+meta_path = os.path.join('data', dataset, 'meta.pkl')
+load_meta = os.path.exists(meta_path)
+if load_meta:
+    print(f"Loading meta from {meta_path}...")
+    with open(meta_path, 'rb') as f:
+        meta = pickle.load(f)
+    # TODO want to make this more general to arbitrary encoder/decoder schemes
+    stoi, itos = meta['stoi'], meta['itos']
+    encode = lambda s: [stoi[c] for c in s]
+    decode = lambda l: ''.join([itos[i] for i in l])
+else:
+    # ok let's assume gpt-2 encodings by default
+    print("No meta.pkl found, assuming GPT-2 encodings...")
+    enc = tiktoken.get_encoding("gpt2")
+    encode = lambda s: enc.encode(s, allowed_special={"<|endoftext|>"})
+    decode = lambda l: enc.decode(l)
+
+# encode context
+context_ids = None
+if enable_context:
+    context_ids = encode(context)
+    context_ids = (torch.tensor(context_ids, dtype=torch.long, device=device)[None, ...])
+
 # poor man's data loader, TODO evaluate need for actual DataLoader
 data_dir = os.path.join('data', dataset)
 train_data = np.memmap(os.path.join(data_dir, 'train.bin'), dtype=np.uint16, mode='r')
 val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
 def get_batch(split):
     data = train_data if split == 'train' else val_data
-    ix = torch.randint(len(data) - block_size, (batch_size,))
+    ix = torch.randint(block_size, len(data) - block_size, (batch_size,))
     x = torch.stack([torch.from_numpy((data[i:i+block_size]).astype(np.int64)) for i in ix])
     y = torch.stack([torch.from_numpy((data[i+1:i+1+block_size]).astype(np.int64)) for i in ix])
     x, y = x.to(device), y.to(device)
+    if enable_context:
+        # z = torch.stack([torch.from_numpy((data[i-block_size:i]).astype(np.int64)) for i in ix])
+        # z = z.to(device)
+        # x = (x, z)
+        x = (x, context_ids)
     return x, y
 
 # init these up here, can override if init_from='resume' (i.e. from a checkpoint)
 iter_num = 0
 best_val_loss = 1e9
 
+
+
 # model init
+model_cls = ContextGPT if enable_context else GPT
 model_args = dict(n_layer = n_layer, n_head = n_head, n_embd = n_embd, block_size = block_size, dropout = dropout)
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    model = model_cls(gptconf)
 elif init_from == 'resume':
     print(f"Resuming training from {out_dir}")
     # resume training from a checkpoint.
@@ -117,10 +155,12 @@ elif init_from == 'resume':
     checkpoint = torch.load(ckpt_path, map_location=device)
     checkpoint_model_args = checkpoint['model_args']
     for k, v in model_args.items():
+        print("checkpoint_model_args[k]", checkpoint_model_args[k])
+        print("v", v)
         assert checkpoint_model_args[k] == v, "for now"
         # TODO: think through how passed in params should interact with checkpoint params
     gptconf = GPTConfig(**model_args)
-    model = GPT(gptconf)
+    model = model_cls(gptconf)
     state_dict = checkpoint['model']
     # fix the keys of the state dictionary :(
     # honestly no idea how checkpoints sometimes get this prefix, have to debug more
@@ -135,7 +175,7 @@ elif init_from.startswith('gpt2'):
     print(f"Initializing from OpenAI GPT-2 weights: {init_from}")
     # initialize from OpenAI GPT-2 weights
     override_args = dict(dropout=dropout)
-    model = GPT.from_pretrained(init_from, override_args)
+    model = model_cls.from_pretrained(init_from, override_args)
     # read off and override the GPT sizing model args from the model config
     model_args['n_layer'] = model.config.n_layer
     model_args['n_head'] = model.config.n_head

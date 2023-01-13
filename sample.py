@@ -6,14 +6,16 @@ import pickle
 from contextlib import nullcontext
 import torch
 import tiktoken
-from model import GPTConfig, GPT
+from model import GPTConfig, GPT, ContextGPT
 
 # -----------------------------------------------------------------------------
 out_dir = 'out'
 ckpt_fn = 'ckpt.pt'
 start = "\n" # or "<|endoftext|>" or whatever you like
-num_samples = 10 # number of samples to draw
-max_new_tokens = 500 # number of tokens generated in each sample
+context = "" # optional context text
+enable_context = True
+num_samples = 1 # number of samples to draw
+max_new_tokens = 50 # number of tokens generated in each sample
 temperature = 0.8 # higher temperature (up to 1) is more random, lower (down to 0) means more greedy
 top_k = 200 # retain only the top_k most likely tokens, clamp others to have 0 probability
 seed = 1337
@@ -35,7 +37,8 @@ ctx = nullcontext() if device_type == 'cpu' else torch.amp.autocast(device_type=
 ckpt_path = os.path.join(out_dir, ckpt_fn)
 checkpoint = torch.load(ckpt_path, map_location=device)
 gptconf = GPTConfig(**checkpoint['model_args'])
-model = GPT(gptconf)
+model_cls = ContextGPT if enable_context else GPT
+model = model_cls(gptconf)
 state_dict = checkpoint['model']
 unwanted_prefix = '_orig_mod.'
 for k,v in list(state_dict.items()):
@@ -70,6 +73,11 @@ else:
 # encode the beginning of the prompt
 start_ids = encode(start)
 x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
+
+if enable_context:
+    context_ids = encode(context)
+    z = (torch.tensor(context_ids, dtype=torch.long, device=device)[None, ...])
+    x = x, z
 
 # run generation
 with torch.no_grad():

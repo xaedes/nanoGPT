@@ -14,7 +14,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 
-# @torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
+@torch.jit.script # good to enable when not using torch.compile, disable when using (our default)
 def new_gelu(x):
     """
     Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT).
@@ -61,6 +61,51 @@ class CausalSelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
+class ContextSelfAttention(nn.Module):
+    # 2020 - Contextual BERT Conditioning the Language Model Using a Global Stat
+    def __init__(self, config):
+        super().__init__()
+        assert config.n_embd % config.n_head == 0
+        # query projections for all heads, but in a batch
+        self.c_qattn = nn.Linear(config.n_embd, config.n_embd)
+        # key, value projections for all heads, but in a batch
+        self.c_kvattn = nn.Linear(config.n_embd, 2 * config.n_embd)
+        # output projection
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+                                    .view(1, 1, config.block_size, config.block_size))
+        # not sure about bias w.r.t to T and CT (see self.forward)
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+
+    def forward(self, x, c):
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        CB, CT, CC = c.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        assert (B == CB)
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        q,   = self.c_qattn(x).split(self.n_embd, dim=2)
+        k ,v  = self.c_kvattn(c).split(self.n_embd, dim=2)
+        k = k.view(B, CT, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, CT, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, CT, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, CT, hs)
+
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, CT) -> (B, nh, T, CT)
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        att = att.masked_fill(self.bias[:,:,:T,:CT] == 0, float('-inf')) # not sure about this w.r.t to T and CT
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v # (B, nh, T, CT) x (B, nh, CT, hs) -> (B, nh, T, hs)
+        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -89,6 +134,28 @@ class Block(nn.Module):
         x = x + self.attn(self.ln_1(x))
         x = x + self.mlp(self.ln_2(x))
         return x
+        # x = (+ x (attn (ln_1 x)))
+        # x = (+ (+ x (attn (ln_1 x))) (mlp (ln_2 (+ x (attn (ln_1 x))))))
+        # x = (+ (attn (ln_1 x)) (mlp (ln_2 x)))
+
+class ContextualBlock(nn.Module):
+
+    def __init__(self, config):
+        super().__init__()
+        self.ctx = MLP(config)
+        self.ln_c = nn.LayerNorm(config.n_embd)
+        self.cattn = ContextSelfAttention(config)
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CausalSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = MLP(config)
+
+    def forward(self, x, c):
+        c = self.ctx(self.ln_c(c))
+        x = x + self.attn(self.ln_1(x))
+        x = self.cattn(self.ln_2(x), c)
+        x = x + self.mlp(x)
+        return x
 
 @dataclass
 class GPTConfig:
@@ -112,7 +179,9 @@ class GPT(nn.Module):
             wpe = nn.Embedding(config.block_size, config.n_embd),
             drop = nn.Dropout(config.dropout),
             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+            # ch = nn.ModuleList([Block(config) for _ in range(2)]), # config.n_layer
             ln_f = nn.LayerNorm(config.n_embd),
+            # context = nn.Linear(config.n_embd, config.vocab_size, bias=False)
         ))
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
 
@@ -127,9 +196,12 @@ class GPT(nn.Module):
         pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
 
         # forward the GPT model itself
+        # print("self.transformer.wte.weight.size()", self.transformer.wte.weight.size())
+        # print("self.transformer.wpe.weight.size()", self.transformer.wpe.weight.size())
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        # print("x.shape", x.shape)
         for block in self.transformer.h:
             x = block(x)
         x = self.transformer.ln_f(x)
@@ -141,6 +213,7 @@ class GPT(nn.Module):
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
         return logits, loss
+    
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -260,8 +333,11 @@ class GPT(nn.Module):
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
             # forward the model to get the logits for the index in the sequence
             logits, _ = self(idx_cond)
+            # print("idx.size()", idx.size())
+            # print("logits.size()", logits.size())
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
+            # print("(logits[:, -1, :] / temperature).size()", logits.size())
             # optionally crop the logits to only the top k options
             if top_k is not None:
                 v, _ = torch.topk(logits, top_k)
@@ -274,3 +350,93 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+
+class ContextGPT(GPT):
+    def __init__(self, config):
+        nn.Module.__init__(self)
+        assert config.vocab_size is not None
+        assert config.block_size is not None
+        self.config = config
+
+        self.transformer = nn.ModuleDict(dict(
+            wce = nn.Embedding(config.vocab_size, config.n_embd),
+            wte = nn.Embedding(config.vocab_size, config.n_embd),
+            wpe = nn.Embedding(config.block_size, config.n_embd),
+            drop = nn.Dropout(config.dropout),
+            h = nn.ModuleList([ContextualBlock(config) for _ in range(config.n_layer)]),
+            ln_f = nn.LayerNorm(config.n_embd),
+            # context = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+
+        # report number of parameters (note we don't count the decoder parameters in lm_head)
+        n_params = sum(p.numel() for p in self.transformer.parameters())
+        print("number of parameters: %.2fM" % (n_params/1e6,))
+
+    def forward(self, idx_context, targets=None):
+        idx, context = idx_context
+        device = idx.device
+        b, t = idx.size()
+        cb, ct = context.size()
+        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+        assert ct <= self.config.block_size, f"Cannot forward sequence with context of length {ct}, block size is only {self.config.block_size}"
+        assert b == cb, f"Batch size of input and context must match, got {b} and {cb}"
+        pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+        cpos = torch.arange(0, ct, dtype=torch.long, device=device).unsqueeze(0) # shape (1, ct)
+
+        # forward the GPT model itself
+        # print("self.transformer.wte.weight.size()", self.transformer.wte.weight.size())
+        # print("self.transformer.wpe.weight.size()", self.transformer.wpe.weight.size())
+        tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (1, t, n_embd)
+        ctok_emb = self.transformer.wte(context) # token embeddings of shape (b, ct, n_embd)
+        cpos_emb = self.transformer.wpe(cpos) # position embeddings of shape (1, ct, n_embd)
+        x = self.transformer.drop(tok_emb + pos_emb)
+        # print("x.shape", x.shape)
+        cx = self.transformer.drop(ctok_emb + cpos_emb)
+        # print("cx.shape", cx.shape)
+        for block in self.transformer.h:
+            x = block(x, cx)
+        x = self.transformer.ln_f(x)
+        logits = self.lm_head(x)
+
+        # if we are given some desired targets also calculate the loss
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+        return logits, loss
+
+    @torch.no_grad()
+    def generate(self, idx_context, max_new_tokens, temperature=1.0, top_k=None):
+        """
+        Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+        the sequence max_new_tokens times, feeding the predictions back into the model each time.
+        Most likely you'll want to make sure to be in model.eval() mode of operation for this.
+        """
+        idx, context = idx_context
+        for _ in range(max_new_tokens):
+            # if the sequence context is growing too long we must crop it at block_size
+            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+            context_cond = context if context.size(1) <= self.config.block_size else context[:, -self.config.block_size:]
+            # forward the model to get the logits for the index in the sequence
+            logits, _ = self((idx_cond, context_cond))
+            print("idx.size()", idx.size())
+            print("logits.size()", logits.size())
+            # pluck the logits at the final step and scale by desired temperature
+            logits = logits[:, -1, :] / temperature
+            print("(logits[:, -1, :] / temperature).size()", logits.size())
+            # optionally crop the logits to only the top k options
+            if top_k is not None:
+                v, _ = torch.topk(logits, top_k)
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            # apply softmax to convert logits to (normalized) probabilities
+            probs = F.softmax(logits, dim=-1)
+            # sample from the distribution
+            idx_next = torch.multinomial(probs, num_samples=1)
+            # append sampled index to the running sequence and continue
+            idx = torch.cat((idx, idx_next), dim=1)
+
+        return idx
+
