@@ -1,3 +1,6 @@
 /__pycache__/
 /out/
 /environment.yaml.hash
+/data/shakespeare/input.txt
+/data/shakespeare/train.bin
+/data/shakespeare/val.bin
